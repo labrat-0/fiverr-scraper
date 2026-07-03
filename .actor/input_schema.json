@@ -1,0 +1,130 @@
+{
+    "title": "Fiverr Scraper Input",
+    "description": "Scrape Fiverr gigs, search results, and seller profiles at scale. Search by keyword, extract full gig details (packages, FAQ, reviews), or scrape seller profiles. Playwright + Apify Residential proxies. No API keys required.",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "mode": {
+            "sectionCaption": "🎯 Scraping Mode",
+            "sectionDescription": "Choose what to scrape on Fiverr.",
+            "title": "🎯 Scraping Mode",
+            "type": "string",
+            "description": "What type of Fiverr data to scrape.",
+            "editor": "select",
+            "enum": ["search_gigs", "gig_details", "seller_profiles"],
+            "enumTitles": [
+                "🔍 Search Gigs — search Fiverr by keyword, collect gig cards with pricing, ratings, seller info",
+                "📄 Gig Details — scrape full details from specific gig URLs (description, packages, FAQ, reviews)",
+                "👤 Seller Profiles — scrape seller profile pages (stats, badges, bio)"
+            ],
+            "default": "search_gigs"
+        },
+        "searchQuery": {
+            "sectionCaption": "🔍 Search Gigs",
+            "sectionDescription": "Search Fiverr by keyword to find gigs matching your query.",
+            "title": "🔍 Search Query",
+            "type": "string",
+            "description": "Keyword or phrase to search for on Fiverr. Example: web scraping, logo design, Python script. Use Search Queries List below for batch search.",
+            "editor": "textfield",
+            "prefill": "web scraping"
+        },
+        "searchQueriesList": {
+            "title": "🔍 Search Queries List (Batch Search)",
+            "type": "array",
+            "description": "Run multiple search queries in a single job — results are merged by scrape order. Overrides the single Search Query field when provided. Ideal for market research and competitor analysis. Example: [\"logo design\", \"web scraping\", \"Python bot\"]",
+            "editor": "json",
+            "prefill": []
+        },
+        "searchSort": {
+            "title": "🔃 Sort Order",
+            "type": "string",
+            "description": "How to sort search results.",
+            "editor": "select",
+            "enum": ["recommended", "best_selling", "newest"],
+            "enumTitles": ["⭐ Recommended", "📈 Best Selling", "🆕 Newest"],
+            "default": "recommended"
+        },
+        "minPrice": {
+            "title": "💰 Min Price ($)",
+            "type": "number",
+            "description": "Minimum gig price filter (optional).",
+            "editor": "number"
+        },
+        "maxPrice": {
+            "title": "💰 Max Price ($)",
+            "type": "number",
+            "description": "Maximum gig price filter (optional).",
+            "editor": "number"
+        },
+        "deliveryTime": {
+            "title": "⏱️ Delivery Time",
+            "type": "string",
+            "description": "Filter by delivery time.",
+            "editor": "select",
+            "enum": ["any", "express_24h", "up_to_3_days", "up_to_7_days", "any_time"],
+            "enumTitles": ["Any", "🚀 Express (24h)", "📦 Up to 3 Days", "📦 Up to 7 Days", "📦 Any Time"],
+            "default": "any"
+        },
+        "category": {
+            "title": "📂 Category",
+            "type": "string",
+            "description": "Optional Fiverr category to narrow search (e.g., 'data-entry', 'programming-tech'). Leave empty for all categories.",
+            "editor": "textfield"
+        },
+        "gigUrls": {
+            "sectionCaption": "📄 Gig Details",
+            "sectionDescription": "Scrape full details from specific gig pages.",
+            "title": "📄 Gig URLs",
+            "type": "array",
+            "description": "Full Fiverr gig URLs to scrape detailed data from (description, packages, FAQ, seller info).",
+            "editor": "stringList",
+            "prefill": ["https://www.fiverr.com/sellerusername/scrape-web-data"]
+        },
+        "sellerUrls": {
+            "sectionCaption": "👤 Seller Profiles",
+            "sectionDescription": "Scrape seller profile pages.",
+            "title": "👤 Seller Profile URLs",
+            "type": "array",
+            "description": "Full Fiverr seller profile URLs to scrape. Example: https://www.fiverr.com/sellerusername",
+            "editor": "stringList",
+            "prefill": ["https://www.fiverr.com/sellerusername"]
+        },
+        "includeReviews": {
+            "title": "⭐ Include Reviews (Gig Details Mode)",
+            "type": "boolean",
+            "description": "When scraping gig details, also extract recent reviews (slower, more data).",
+            "default": false
+        },
+        "maxResults": {
+            "sectionCaption": "⚙️ Scraper Settings",
+            "sectionDescription": "Control output volume and proxy configuration.",
+            "title": "🔢 Max Results",
+            "type": "integer",
+            "description": "Maximum number of results to return. Free users limited to 25 per run.",
+            "default": 100,
+            "minimum": 1,
+            "maximum": 10000
+        },
+        "maxPages": {
+            "title": "📄 Max Pages (Search Mode)",
+            "type": "integer",
+            "description": "Max search result pages to scrape per query (~24 gigs per page).",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 100
+        },
+        "proxyConfiguration": {
+            "sectionCaption": "🔒 Proxy Configuration",
+            "sectionDescription": "Fiverr uses PerimeterX bot protection. Residential proxies strongly recommended.",
+            "title": "🔒 Proxy Configuration",
+            "type": "object",
+            "description": "Proxy settings. Fiverr blocks datacenter IPs — residential proxies strongly recommended.",
+            "editor": "proxy",
+            "prefill": {
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
+            }
+        }
+    },
+    "required": ["mode"]
+}

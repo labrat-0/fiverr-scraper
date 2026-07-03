@@ -1,0 +1,17 @@
+{
+    "actorSpecification": 1,
+    "name": "fiverr-scraper",
+    "title": "Fiverr Scraper",
+    "version": "1.0.0",
+    "buildTag": "latest",
+    "input": "./input_schema.json",
+    "output": "./output_schema.json",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "./Dockerfile",
+    "defaultRunOptions": {
+        "memoryMbytes": 2048,
+        "timeoutSecs": 1800
+    }
+}
