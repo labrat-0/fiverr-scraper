@@ -44,6 +44,14 @@ async def main() -> None:
             await Actor.fail(status_message=validation_error)
             return
 
+        # 1b. Charge actor-start — one-time per run fee
+        start_charge = await Actor.charge(event_name="actor-start")
+        if start_charge and start_charge.event_charge_limit_reached:
+            await Actor.fail(
+                status_message="Run limit reached. Please subscribe to continue using this actor."
+            )
+            return
+
         # 2. Free user limit
         is_paying = os.environ.get("APIFY_IS_AT_HOME") == "1" and os.environ.get(
             "APIFY_USER_IS_PAYING"
@@ -104,6 +112,15 @@ async def main() -> None:
                             if count >= max_results:
                                 break
 
+                            # Charge per-gig for each result
+                            gig_charge = await Actor.charge(event_name="per-gig")
+                            if gig_charge and gig_charge.event_charge_limit_reached:
+                                Actor.log.warning(
+                                    "Event charge limit reached on per-gig. Stopping."
+                                )
+                                cost_exceeded = True
+                                break
+
                             batch.append(gig)
                             count += 1
                             state["scraped"] = count
@@ -162,6 +179,14 @@ async def main() -> None:
                         config.gig_urls,
                         include_reviews=config.include_reviews,
                     ):
+                        # Charge per-gig-detail for each result
+                        detail_charge = await Actor.charge(event_name="per-gig-detail")
+                        if detail_charge and detail_charge.event_charge_limit_reached:
+                            Actor.log.warning(
+                                "Event charge limit reached on per-gig-detail. Stopping."
+                            )
+                            break
+
                         batch.append(detail)
                         count += 1
                         state["scraped"] = count
@@ -186,6 +211,14 @@ async def main() -> None:
                     async for profile in scraper.seller_profiles(
                         config.seller_urls
                     ):
+                        # Charge per-seller-profile for each result
+                        seller_charge = await Actor.charge(event_name="per-seller-profile")
+                        if seller_charge and seller_charge.event_charge_limit_reached:
+                            Actor.log.warning(
+                                "Event charge limit reached on per-seller-profile. Stopping."
+                            )
+                            break
+
                         batch.append(profile)
                         count += 1
                         state["scraped"] = count
