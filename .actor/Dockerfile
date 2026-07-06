@@ -2,7 +2,9 @@ FROM apify/actor-python:3.12
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium --with-deps
+# Patchright ships its own patched Chromium; install it plus vanilla as fallback.
+RUN patchright install chromium --with-deps
+RUN playwright install chromium
 
 COPY . ./
 

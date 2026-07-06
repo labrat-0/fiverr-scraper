@@ -32,8 +32,10 @@ SEARCH_URL = f"{FIVERR_BASE}/search/gigs"
 # Free tier limit
 FREE_TIER_LIMIT = 25
 
-# Navigate timeout
-NAV_TIMEOUT_MS = 90000
+# Navigate timeout. Fiverr responds fast when it responds at all; a 90s
+# wait mostly just delays hitting the PerimeterX challenge path. Keep it
+# tight so 3 attempts can't burn 4+ minutes before the challenge handler runs.
+NAV_TIMEOUT_MS = 45000
 
 # How many seconds to wait after page load for dynamic content
 POST_NAV_WAIT_SECS = 3.0
@@ -46,6 +48,31 @@ MAX_NAV_RETRIES = 2
 
 # Scroll delay to trigger lazy loading
 SCROLL_DELAY_SECS = 1.0
+
+# Text markers that mean the page is a bot/challenge wall, not real content.
+# Fiverr fronts with PerimeterX ("It needs a human touch" / ERRCODE PXCR...)
+# and occasionally Cloudflare. Keep this list authoritative — both the
+# detector and the post-nav guard read from it.
+CHALLENGE_MARKERS = [
+    "please verify you are a human",
+    "access denied",
+    "sorry, you have been blocked",
+    "automated access",
+    "perimeterx",
+    "human verification",
+    "just a moment",
+    "checking your browser",
+    "cf-error",
+    "cf-browser-verification",
+    "cloudflare",
+    # PerimeterX current block page
+    "it needs a human touch",
+    "needs a human touch",
+    "loading challenge",
+    "pxcr",
+    "px-captcha",
+    "complete the task and we",
+]
 
 
 # --- Selectors ---
@@ -182,27 +209,40 @@ class FiverrScraper:
         )
         proxy_url = await proxy_config.new_url() if proxy_config else None
 
-        from playwright.async_api import async_playwright
+        # Prefer Patchright (undetected Playwright fork) — it patches the
+        # CDP/runtime leaks PerimeterX fingerprints on. Fall back to vanilla
+        # Playwright if Patchright isn't installed (e.g. local dev).
+        try:
+            from patchright.async_api import async_playwright
+            self._engine = "patchright"
+        except ImportError:
+            from playwright.async_api import async_playwright
+            self._engine = "playwright"
+        logger.info(f"Browser engine: {self._engine}")
+
         self._playwright = await async_playwright().start()
 
-        # Stealth launch args to evade PerimeterX / Cloudflare
-        launch_options = {
-            "headless": True,
-            "args": [
+        # Container-safe args only. Under Patchright the classic "stealth" flags
+        # (--disable-blink-features=AutomationControlled, --disable-web-security)
+        # are counterproductive — they are themselves detectable and Patchright
+        # already neutralizes the automation signals they targeted.
+        base_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+        if self._engine == "playwright":
+            base_args += [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-features=IsolateOrigins,site-per-process",
                 "--disable-web-security",
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
                 "--disable-infobars",
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
-                "--disable-dev-shm-usage",
                 "--window-size=1920,1080",
-                "--start-maximized",
-            ],
-        }
+            ]
+        launch_options = {"headless": True, "args": base_args}
         if proxy_url:
             launch_options["proxy"] = {"server": proxy_url}
 
@@ -233,40 +273,43 @@ class FiverrScraper:
             },
         )
 
-        # Stealth init script — hide automation fingerprints
-        await self._context.add_init_script("""
-            // Override navigator.webdriver
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        # Manual stealth init script — ONLY for vanilla Playwright. Patchright
+        # injects its masks into an isolated world; a main-world init script
+        # like this one is itself a detectable fingerprint, so we skip it.
+        if self._engine == "playwright":
+            await self._context.add_init_script("""
+                // Override navigator.webdriver
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
 
-            // Override navigator.plugins
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5],
-            });
+                // Override navigator.plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
 
-            // Override navigator.languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en'],
-            });
+                // Override navigator.languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
 
-            // Override chrome.runtime
-            window.chrome = {
-                runtime: {},
-                loadTimes: function() {},
-                csi: function() {},
-                app: {}
-            };
+                // Override chrome.runtime
+                window.chrome = {
+                    runtime: {},
+                    loadTimes: function() {},
+                    csi: function() {},
+                    app: {}
+                };
 
-            // Override permissions
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters)
-            );
+                // Override permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(parameters)
+                );
 
-            // Remove webdriver trace from stack traces
-            Error.stackTraceLimit = Infinity;
-        """)
+                // Remove webdriver trace from stack traces
+                Error.stackTraceLimit = Infinity;
+            """)
 
         # Block unnecessary resources AFTER stealth init
         # NOTE: Not blocking resources initially — Cloudflare challenge may
@@ -310,21 +353,10 @@ class FiverrScraper:
             page_text = await self._page.inner_text("body")
         except Exception:
             page_text = ""
-        markers = [
-            "please verify you are a human",
-            "access denied",
-            "sorry, you have been blocked",
-            "automated access",
-            "perimeterx",
-            "challenge",
-            "human verification",
-            "just a moment",
-            "checking your browser",
-            "cf-error",
-            "cf-browser-verification",
-            "cloudflare",
-        ]
-        return any(marker in page_text.lower() for marker in markers)
+        # Title often carries the block signal even when body is still a spinner.
+        title = (await self._page.title() or "").lower()
+        haystack = f"{title}\n{page_text}".lower()
+        return any(marker in haystack for marker in CHALLENGE_MARKERS)
 
     async def _wait_for_challenge_to_resolve(self) -> bool:
         """Poll for Cloudflare challenge resolution up to CF_CHALLENGE_MAX_WAIT.
@@ -371,7 +403,12 @@ class FiverrScraper:
         before enabling resource blocking and checking for actual content.
         Returns True if we detect real Fiverr content.
         """
-        wait_strategies = ["domcontentloaded", "load", "commit"]
+        # "commit" fires as soon as the response arrives, so we reach the
+        # PerimeterX challenge handler immediately instead of waiting out a
+        # 45s timeout on domcontentloaded/load (which the challenge page can
+        # stall indefinitely). "load" is intentionally omitted: it is stricter
+        # than domcontentloaded and only ever slows us down on Fiverr's SPA.
+        wait_strategies = ["commit", "domcontentloaded", "commit"]
 
         for attempt in range(1 + MAX_NAV_RETRIES):
             strategy = wait_strategies[min(attempt, len(wait_strategies) - 1)]
@@ -396,22 +433,27 @@ class FiverrScraper:
                 # Wait a beat for dynamic content
                 await asyncio.sleep(POST_NAV_WAIT_SECS)
 
-                # --- Cloudflare challenge handling (commit strategy) ---
-                # The commit strategy succeeds even when Cloudflare is serving
-                # a challenge page. We need to actively wait for the challenge
-                # to resolve, then enable resource blocking.
-                is_challenge = await self._detect_challenge_page()
-                if is_challenge and strategy == "commit":
+                # --- Bot-challenge handling ---
+                # PerimeterX / Cloudflare can serve a challenge under ANY wait
+                # strategy (the page "loads" but shows a wall), so handle it on
+                # every attempt, not only on "commit".
+                if await self._detect_challenge_page():
                     logger.info(
-                        f"Challenge page detected on commit strategy. "
+                        f"Challenge page detected (strategy={strategy}). "
                         f"Waiting for resolution..."
                     )
                     resolved = await self._wait_for_challenge_to_resolve()
                     if not resolved:
                         logger.error(
                             f"Challenge did not resolve for {url}. "
-                            f"Giving up."
+                            "PerimeterX is blocking this session — a residential "
+                            "proxy and/or a stealth browser engine is required. "
+                            "Retrying with a fresh strategy."
                         )
+                        # Let the retry loop try again (new proxy URL / strategy)
+                        if attempt < MAX_NAV_RETRIES:
+                            await asyncio.sleep(3 * (2 ** attempt))
+                            continue
                         return False
                     # Challenge resolved — now we should be on the actual page
                     await asyncio.sleep(POST_NAV_WAIT_SECS)
@@ -442,18 +484,7 @@ class FiverrScraper:
                     page_text = ""
 
                 if any(
-                    marker in page_text.lower()
-                    for marker in [
-                        "please verify you are a human",
-                        "access denied",
-                        "sorry, you have been blocked",
-                        "automated access",
-                        "perimeterx",
-                        "challenge",
-                        "human verification",
-                        "just a moment",
-                        "checking your browser",
-                    ]
+                    marker in page_text.lower() for marker in CHALLENGE_MARKERS
                 ):
                     logger.warning(f"Bot detection triggered at {url}")
                     return False
