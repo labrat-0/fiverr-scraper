@@ -330,6 +330,7 @@ class FiverrScraper:
 
         self._page = await self._context.new_page()
         self._page.set_default_timeout(NAV_TIMEOUT_MS)
+        self._warmed = False
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -404,6 +405,38 @@ class FiverrScraper:
         except Exception:
             return False
 
+    async def _warmup(self) -> None:
+        """Prime the PerimeterX session before hitting deep URLs.
+
+        Cold-loading /search/gigs with no `_px3` cookie and no referer is a
+        strong bot signal → HTTP 403. A human lands on the homepage first, so
+        we do too: visit the homepage, let PX set its cookie, do a little
+        human-like movement, then real navigations carry the cookie + referer.
+        """
+        self._warmed = True  # set first so a failed warmup doesn't loop
+        try:
+            logger.info("Warming up session via homepage...")
+            await self._page.goto(
+                FIVERR_BASE,
+                wait_until="domcontentloaded",
+                timeout=NAV_TIMEOUT_MS,
+            )
+            await asyncio.sleep(random.uniform(3.0, 6.0))
+            if await self._detect_challenge_page():
+                logger.info("Homepage warmup hit a challenge; waiting it out...")
+                await self._wait_for_challenge_to_resolve()
+            # Light human-like interaction to age the session.
+            try:
+                await self._page.mouse.move(
+                    random.randint(200, 800), random.randint(200, 600)
+                )
+                await self._page.evaluate("window.scrollTo(0, 500)")
+                await asyncio.sleep(random.uniform(1.0, 2.5))
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Warmup navigation failed (continuing anyway): {e}")
+
     async def _navigate(
         self, url: str, wait_for_selector: str | None = None
     ) -> bool:
@@ -421,6 +454,14 @@ class FiverrScraper:
         # than domcontentloaded and only ever slows us down on Fiverr's SPA.
         wait_strategies = ["commit", "domcontentloaded", "commit"]
 
+        # Warm up the PX session on the homepage before any deep URL.
+        if not self._warmed and not url.rstrip("/") == FIVERR_BASE:
+            await self._warmup()
+
+        # A referer makes the request look like in-site navigation, not a
+        # cold deep-link — another signal PerimeterX scores on.
+        referer = FIVERR_BASE if not url.rstrip("/") == FIVERR_BASE else None
+
         for attempt in range(1 + MAX_NAV_RETRIES):
             strategy = wait_strategies[min(attempt, len(wait_strategies) - 1)]
             try:
@@ -434,6 +475,7 @@ class FiverrScraper:
                     url,
                     wait_until=strategy,
                     timeout=NAV_TIMEOUT_MS,
+                    referer=referer,
                 )
 
                 status = resp.status if resp else None
