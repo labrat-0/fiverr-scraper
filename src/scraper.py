@@ -244,7 +244,18 @@ class FiverrScraper:
             ]
         launch_options = {"headless": True, "args": base_args}
         if proxy_url:
-            launch_options["proxy"] = {"server": proxy_url}
+            # Chromium ignores inline proxy credentials in the server URL
+            # (http://user:pass@host:port) and returns HTTP 407. Playwright
+            # requires username/password as separate fields.
+            parsed_proxy = urlparse(proxy_url)
+            launch_options["proxy"] = {
+                "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}"
+                f":{parsed_proxy.port}",
+            }
+            if parsed_proxy.username:
+                launch_options["proxy"]["username"] = parsed_proxy.username
+            if parsed_proxy.password:
+                launch_options["proxy"]["password"] = parsed_proxy.password
 
         self._browser = await self._playwright.chromium.launch(**launch_options)
 
