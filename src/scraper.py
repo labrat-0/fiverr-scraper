@@ -173,7 +173,7 @@ class FiverrScraper:
         proxy_config = await Actor.create_proxy_configuration(
             actor_proxy_input=self.config.proxy_configuration
         )
-        proxy_url = await proxy_config.get_proxy_url() if proxy_config else None
+        proxy_url = await proxy_config.new_url() if proxy_config else None
 
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
