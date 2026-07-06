@@ -59,6 +59,12 @@ class ScraperInput(BaseModel):
 
     proxy_configuration: dict | None = None
 
+    # Optional customer-supplied unblocker/anti-bot proxy URL. When set, all
+    # requests route through it and the homepage warmup + IP rotation are
+    # skipped (the unblocker solves PerimeterX itself, so extra requests only
+    # cost the customer). This is the reliable path for Fiverr's PX wall.
+    unblocker_proxy_url: str = ""
+
     @field_validator("search_queries_list", mode="before")
     @classmethod
     def clean_queries_list(
@@ -100,6 +106,7 @@ class ScraperInput(BaseModel):
             max_pages=raw.get("maxPages", 10),
             include_reviews=raw.get("includeReviews", False),
             proxy_configuration=raw.get("proxyConfiguration"),
+            unblocker_proxy_url=(raw.get("unblockerProxyUrl") or "").strip(),
         )
 
     def validate_for_mode(self) -> str | None:

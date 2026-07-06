@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -40,15 +41,19 @@ NAV_TIMEOUT_MS = 45000
 # How many seconds to wait after page load for dynamic content
 POST_NAV_WAIT_SECS = 3.0
 
-# Max seconds to wait for Cloudflare challenge to resolve (commit strategy)
-CF_CHALLENGE_MAX_WAIT = 20.0
+# Max seconds to wait for a challenge to resolve. Kept short: a PerimeterX
+# 403 does not self-clear, so a long wait just burns paid compute per IP.
+CF_CHALLENGE_MAX_WAIT = 8.0
 
 # Max retries per navigation (wait-strategy fallbacks within one IP)
 MAX_NAV_RETRIES = 2
 
 # Max times to rotate to a fresh residential IP when a session is blocked
-# (PerimeterX 403) or the proxy tunnel is dead. Caps proxy spend per URL.
-MAX_SESSION_ROTATIONS = 4
+# (PerimeterX 403) or the proxy tunnel is dead. Kept LOW: Fiverr's PX blocks
+# the Apify residential pool near-universally, so extra rotations mostly burn
+# paid compute + bandwidth for the same 403. A customer-supplied unblocker
+# proxy (see input) is what actually gets results. Override via env if needed.
+MAX_SESSION_ROTATIONS = int(os.environ.get("FIVERR_MAX_IP_ROTATIONS", "1"))
 
 # Scroll delay to trigger lazy loading
 SCROLL_DELAY_SECS = 1.0
@@ -198,10 +203,14 @@ class FiverrScraper:
         config: ScraperInput,
         max_pages: int = 10,
         max_results: int = 100,
+        use_unblocker: bool = False,
     ) -> None:
         self.config = config
         self.max_pages = max_pages
         self.max_results = max_results
+        # When routing through a customer unblocker proxy, PX is solved upstream:
+        # skip homepage warmup and IP rotation so we don't pay for extra requests.
+        self.use_unblocker = use_unblocker
         self._browser = None
         self._context = None
         self._page = None
@@ -485,12 +494,12 @@ class FiverrScraper:
 
             # Let the sensor's network activity settle.
             try:
-                await self._page.wait_for_load_state("networkidle", timeout=15000)
+                await self._page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
                 pass
 
             # Human-like interaction to trip the PX behavioural sensor.
-            for _ in range(3):
+            for _ in range(2):
                 try:
                     await self._page.mouse.move(
                         random.randint(100, 1200), random.randint(100, 700)
@@ -498,10 +507,10 @@ class FiverrScraper:
                     await self._page.mouse.wheel(0, random.randint(300, 900))
                 except Exception:
                     pass
-                await asyncio.sleep(random.uniform(0.8, 1.8))
+                await asyncio.sleep(random.uniform(0.6, 1.2))
 
-            # Poll for the PX token — up to ~15s — before going deeper.
-            deadline = time.monotonic() + 15.0
+            # Poll for the PX token — up to ~8s — before going deeper.
+            deadline = time.monotonic() + 8.0
             while time.monotonic() < deadline:
                 if await self._has_px_cookie():
                     logger.info("PerimeterX cookie acquired during warmup.")
@@ -524,10 +533,13 @@ class FiverrScraper:
         proxy session (new exit IP) and try again, up to MAX_SESSION_ROTATIONS.
         A session that succeeds is kept for subsequent pages.
         """
-        for session_attempt in range(1 + MAX_SESSION_ROTATIONS):
+        # Unblocker solves PX upstream and typically gives a fresh IP per
+        # request, so rotating our proxy session buys nothing — don't pay for it.
+        max_rotations = 0 if self.use_unblocker else MAX_SESSION_ROTATIONS
+        for session_attempt in range(1 + max_rotations):
             if await self._try_navigate(url, wait_for_selector):
                 return True
-            if session_attempt < MAX_SESSION_ROTATIONS:
+            if session_attempt < max_rotations:
                 logger.warning(
                     f"Session blocked/failed for {url} — rotating IP "
                     f"({session_attempt + 1}/{MAX_SESSION_ROTATIONS})."
@@ -556,8 +568,14 @@ class FiverrScraper:
         # than domcontentloaded and only ever slows us down on Fiverr's SPA.
         wait_strategies = ["commit", "domcontentloaded", "commit"]
 
-        # Warm up the PX session on the homepage before any deep URL.
-        if not self._warmed and not url.rstrip("/") == FIVERR_BASE:
+        # Warm up the PX session on the homepage before any deep URL — unless
+        # an unblocker is handling PX for us (warmup would just cost the customer
+        # an extra solved request).
+        if (
+            not self.use_unblocker
+            and not self._warmed
+            and not url.rstrip("/") == FIVERR_BASE
+        ):
             await self._warmup()
 
         # A referer makes the request look like in-site navigation, not a

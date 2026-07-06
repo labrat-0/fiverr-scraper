@@ -70,11 +70,23 @@ async def main() -> None:
             f"max_results={max_results}"
         )
 
-        # 3. Set up proxy — Residential for PerimeterX
-        proxy_input = raw_input.get("proxyConfiguration") or {
-            "useApifyProxy": True,
-            "apifyProxyGroups": ["RESIDENTIAL"],
-        }
+        # 3. Set up proxy. A customer-supplied unblocker URL wins — it solves
+        # PerimeterX itself, so we route everything through it and skip the
+        # warmup/rotation dance. Otherwise fall back to Apify residential.
+        use_unblocker = bool(config.unblocker_proxy_url)
+        if use_unblocker:
+            config.proxy_configuration = {
+                "useApifyProxy": False,
+                "proxyUrls": [config.unblocker_proxy_url],
+            }
+            Actor.log.info(
+                "Using customer unblocker proxy — warmup & IP rotation disabled."
+            )
+        elif not config.proxy_configuration:
+            config.proxy_configuration = {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+            }
 
         # 4. Resume state
         state = await Actor.use_state(default_value={"scraped": 0, "failed": 0})
@@ -92,6 +104,7 @@ async def main() -> None:
             config,
             max_pages=config.max_pages,
             max_results=max_results,
+            use_unblocker=use_unblocker,
         ) as scraper:
             try:
                 if config.mode.value == "search_gigs":

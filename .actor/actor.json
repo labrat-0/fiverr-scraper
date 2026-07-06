@@ -11,6 +11,6 @@
     "dockerfile": "./Dockerfile",
     "defaultRunOptions": {
         "memoryMbytes": 2048,
-        "timeoutSecs": 1800
+        "timeoutSecs": 600
     }
 }

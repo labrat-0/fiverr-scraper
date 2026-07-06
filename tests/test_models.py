@@ -103,6 +103,13 @@ class TestScraperInputValidation:
         assert inp.search_query == ""
         assert inp.max_results == 100
         assert inp.include_reviews is False
+        assert inp.unblocker_proxy_url == ""
+
+    def test_unblocker_proxy_url_mapped_and_trimmed(self):
+        raw = {"mode": "search_gigs", "searchQuery": "x",
+                "unblockerProxyUrl": "  http://u:p@host:8080  "}
+        inp = ScraperInput.from_actor_input(raw)
+        assert inp.unblocker_proxy_url == "http://u:p@host:8080"
 
     def test_enum_values(self):
         assert ScrapingMode.SEARCH_GIGS.value == "search_gigs"

@@ -124,6 +124,13 @@
                 "useApifyProxy": true,
                 "apifyProxyGroups": ["RESIDENTIAL"]
             }
+        },
+        "unblockerProxyUrl": {
+            "title": "🛡️ Unblocker Proxy URL (for reliable results)",
+            "type": "string",
+            "description": "Fiverr's PerimeterX blocks Apify residential IPs on search. For reliable results, paste your own anti-bot / unblocker proxy URL (e.g. Bright Data Web Unlocker, ZenRows, ScrapingBee proxy endpoint): http://user:pass@host:port. When set, all requests route through it and warmup/IP-rotation are skipped. You pay your unblocker provider directly. Leave empty to use the (free but often blocked) residential path.",
+            "editor": "textfield",
+            "isSecret": true
         }
     },
     "required": ["mode"]
