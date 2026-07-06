@@ -421,10 +421,12 @@ class FiverrScraper:
         if not text:
             return 0
         # Pattern: "(X)" or "X reviews" or "X ratings"
-        match = re.search(r"\((\d+(?:[KkMmBb])?)\)", text)
+        match = re.search(r"\((\d+(?:\.\d+)?[KkMmBb]?)\)", text)
         if match:
             return self._parse_count(match.group(1))
-        match = re.search(r"(\d+(?:[KkMmBb])?)\s*(?:reviews|ratings)", text, re.I)
+        match = re.search(
+            r"(\d+(?:\.\d+)?[KkMmBb]?)\s*(?:reviews|ratings)", text, re.I
+        )
         if match:
             return self._parse_count(match.group(1))
         return 0

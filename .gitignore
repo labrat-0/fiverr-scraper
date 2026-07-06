@@ -33,3 +33,6 @@ Thumbs.db
 
 # Deployment strategy (private — stored in _apify_intel/deployment/ only)
 DEPLOYMENT_INFO.md
+
+# Test artifacts
+.pytest_cache/

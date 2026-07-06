@@ -66,7 +66,7 @@ class ScraperInput(BaseModel):
     ) -> list[str]:
         if not v:
             return []
-        return [q.strip() for q in v if q.strip()]
+        return [q.strip() for q in v if q and q.strip()]
 
     @field_validator("gig_urls", mode="before")
     @classmethod
