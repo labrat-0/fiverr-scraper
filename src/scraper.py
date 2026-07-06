@@ -38,6 +38,9 @@ NAV_TIMEOUT_MS = 90000
 # How many seconds to wait after page load for dynamic content
 POST_NAV_WAIT_SECS = 3.0
 
+# Max seconds to wait for Cloudflare challenge to resolve (commit strategy)
+CF_CHALLENGE_MAX_WAIT = 20.0
+
 # Max retries per navigation
 MAX_NAV_RETRIES = 2
 
@@ -266,18 +269,10 @@ class FiverrScraper:
         """)
 
         # Block unnecessary resources AFTER stealth init
-        await self._context.route(
-            re.compile(r"\.(png|jpg|jpeg|gif|svg|woff2?|ttf|eot)(\?.*)?$"),
-            lambda route: route.abort(),
-        )
-        await self._context.route(
-            re.compile(
-                r"(analytics|tracking|beacon|sentry|logrocket|fullstory)"
-                r"\.(js|gif)",
-                re.IGNORECASE
-            ),
-            lambda route: route.abort(),
-        )
+        # NOTE: Not blocking resources initially — Cloudflare challenge may
+        # need JS/CSS to complete. Blocking is applied per-page in _navigate
+        # after content is confirmed human-readable.
+        self._resource_blocking_enabled = False
 
         self._page = await self._context.new_page()
         self._page.set_default_timeout(NAV_TIMEOUT_MS)
@@ -291,13 +286,90 @@ class FiverrScraper:
         if self._playwright:
             await self._playwright.stop()
 
+    async def _enable_resource_blocking(self) -> None:
+        """Block unnecessary resources (images, fonts, analytics, tracking)
+        AFTER content is confirmed human-readable (not a challenge page).
+        """
+        await self._context.route(
+            re.compile(r"\.(png|jpg|jpeg|gif|svg|woff2?|ttf|eot)(\?.*)?$"),
+            lambda route: route.abort(),
+        )
+        await self._context.route(
+            re.compile(
+                r"(analytics|tracking|beacon|sentry|logrocket|fullstory)"
+                r"\.(js|gif)",
+                re.IGNORECASE
+            ),
+            lambda route: route.abort(),
+        )
+        self._resource_blocking_enabled = True
+
+    async def _detect_challenge_page(self) -> bool:
+        """Check if the current page is a Cloudflare / PerimeterX challenge."""
+        try:
+            page_text = await self._page.inner_text("body")
+        except Exception:
+            page_text = ""
+        markers = [
+            "please verify you are a human",
+            "access denied",
+            "sorry, you have been blocked",
+            "automated access",
+            "perimeterx",
+            "challenge",
+            "human verification",
+            "just a moment",
+            "checking your browser",
+            "cf-error",
+            "cf-browser-verification",
+            "cloudflare",
+        ]
+        return any(marker in page_text.lower() for marker in markers)
+
+    async def _wait_for_challenge_to_resolve(self) -> bool:
+        """Poll for Cloudflare challenge resolution up to CF_CHALLENGE_MAX_WAIT.
+        Returns True if the challenge resolved (page now shows real content).
+        """
+        logger.info(
+            f"Cloudflare challenge detected. "
+            f"Waiting up to {CF_CHALLENGE_MAX_WAIT}s for resolution..."
+        )
+        deadline = time.monotonic() + CF_CHALLENGE_MAX_WAIT
+        poll_interval = 2.0
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+            if not await self._detect_challenge_page():
+                logger.info("Cloudflare challenge resolved.")
+                return True
+            # Also check if the URL redirected to actual Fiverr content
+            current_url = self._page.url
+            if "captcha" in current_url.lower() or "challenge" in current_url.lower():
+                continue  # Still on challenge page
+            if current_url.startswith(FIVERR_BASE):
+                # Still on Fiverr but challenge might have passed
+                continue
+        logger.warning(f"Cloudflare challenge did not resolve within {CF_CHALLENGE_MAX_WAIT}s.")
+        return False
+
+    async def _check_page_content(self) -> bool:
+        """Return True if the page has real content (not blank/blocked).
+        Checks body for meaningful content length.
+        """
+        try:
+            body_text = await self._page.inner_text("body")
+            return len(body_text.strip()) > 100
+        except Exception:
+            return False
+
     async def _navigate(
         self, url: str, wait_for_selector: str | None = None
     ) -> bool:
         """Navigate to a URL and wait for content.
 
         Retries with fallback wait strategies if initial load fails.
-        Returns True if we detect content (not a captcha/bot page).
+        On commit strategy, actively waits for Cloudflare challenges to resolve
+        before enabling resource blocking and checking for actual content.
+        Returns True if we detect real Fiverr content.
         """
         wait_strategies = ["domcontentloaded", "load", "commit"]
 
@@ -323,6 +395,39 @@ class FiverrScraper:
 
                 # Wait a beat for dynamic content
                 await asyncio.sleep(POST_NAV_WAIT_SECS)
+
+                # --- Cloudflare challenge handling (commit strategy) ---
+                # The commit strategy succeeds even when Cloudflare is serving
+                # a challenge page. We need to actively wait for the challenge
+                # to resolve, then enable resource blocking.
+                is_challenge = await self._detect_challenge_page()
+                if is_challenge and strategy == "commit":
+                    logger.info(
+                        f"Challenge page detected on commit strategy. "
+                        f"Waiting for resolution..."
+                    )
+                    resolved = await self._wait_for_challenge_to_resolve()
+                    if not resolved:
+                        logger.error(
+                            f"Challenge did not resolve for {url}. "
+                            f"Giving up."
+                        )
+                        return False
+                    # Challenge resolved — now we should be on the actual page
+                    await asyncio.sleep(POST_NAV_WAIT_SECS)
+
+                    # Check if we still see a challenge
+                    if await self._detect_challenge_page():
+                        logger.error(
+                            f"Still on challenge page after {CF_CHALLENGE_MAX_WAIT}s "
+                            f"for {url}"
+                        )
+                        return False
+
+                # --- Enable deferred resource blocking ---
+                # Only block resources AFTER Cloudflare challenge resolved
+                if not self._resource_blocking_enabled:
+                    await self._enable_resource_blocking()
 
                 # Check page URL — detect redirects to captcha/bot pages
                 current_url = self._page.url
@@ -351,6 +456,16 @@ class FiverrScraper:
                     ]
                 ):
                     logger.warning(f"Bot detection triggered at {url}")
+                    return False
+
+                # Check page has actual content
+                if not await self._check_page_content():
+                    logger.warning(
+                        f"Page loaded but has no meaningful content at {url}"
+                    )
+                    if strategy != "commit":
+                        # Try next strategy
+                        continue
                     return False
 
                 if wait_for_selector:
