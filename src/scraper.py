@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from typing import Any, AsyncGenerator
@@ -32,10 +33,13 @@ SEARCH_URL = f"{FIVERR_BASE}/search/gigs"
 FREE_TIER_LIMIT = 25
 
 # Navigate timeout
-NAV_TIMEOUT_MS = 60000
+NAV_TIMEOUT_MS = 90000
 
 # How many seconds to wait after page load for dynamic content
 POST_NAV_WAIT_SECS = 3.0
+
+# Max retries per navigation
+MAX_NAV_RETRIES = 2
 
 # Scroll delay to trigger lazy loading
 SCROLL_DELAY_SECS = 1.0
@@ -178,32 +182,94 @@ class FiverrScraper:
         from playwright.async_api import async_playwright
         self._playwright = await async_playwright().start()
 
+        # Stealth launch args to evade PerimeterX / Cloudflare
         launch_options = {
             "headless": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-web-security",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-infobars",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-dev-shm-usage",
+                "--window-size=1920,1080",
+                "--start-maximized",
+            ],
         }
         if proxy_url:
             launch_options["proxy"] = {"server": proxy_url}
 
         self._browser = await self._playwright.chromium.launch(**launch_options)
 
+        # Randomize viewport slightly per session
+        viewport_w = random.randint(1850, 1920)
+        viewport_h = random.randint(950, 1080)
+
         self._context = await self._browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
+                "Chrome/126.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1920, "height": 1080},
+            viewport={"width": viewport_w, "height": viewport_h},
+            device_scale_factor=1,
             locale="en-US",
+            timezone_id="America/New_York",
+            has_touch=False,
+            is_mobile=False,
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Sec-Ch-Ua": '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
             },
         )
-        # Block unnecessary resources to speed up loading
+
+        # Stealth init script — hide automation fingerprints
+        await self._context.add_init_script("""
+            // Override navigator.webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+
+            // Override navigator.plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+
+            // Override navigator.languages
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['en-US', 'en'],
+            });
+
+            // Override chrome.runtime
+            window.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {}
+            };
+
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(parameters)
+            );
+
+            // Remove webdriver trace from stack traces
+            Error.stackTraceLimit = Infinity;
+        """)
+
+        # Block unnecessary resources AFTER stealth init
         await self._context.route(
             re.compile(r"\.(png|jpg|jpeg|gif|svg|woff2?|ttf|eot)(\?.*)?$"),
             lambda route: route.abort(),
         )
-        # Block analytics and tracking
         await self._context.route(
             re.compile(
                 r"(analytics|tracking|beacon|sentry|logrocket|fullstory)"
@@ -230,50 +296,91 @@ class FiverrScraper:
     ) -> bool:
         """Navigate to a URL and wait for content.
 
+        Retries with fallback wait strategies if initial load fails.
         Returns True if we detect content (not a captcha/bot page).
         """
-        try:
-            logger.info(f"Navigating to: {url}")
-            resp = await self._page.goto(url, wait_until="domcontentloaded")
-            if resp is None:
-                return False
+        wait_strategies = ["domcontentloaded", "load", "commit"]
 
-            # Wait a beat for dynamic content
-            await asyncio.sleep(POST_NAV_WAIT_SECS)
+        for attempt in range(1 + MAX_NAV_RETRIES):
+            strategy = wait_strategies[min(attempt, len(wait_strategies) - 1)]
+            try:
+                logger.info(
+                    f"Navigating to: {url} "
+                    f"(attempt {attempt + 1}/{1 + MAX_NAV_RETRIES}, "
+                    f"wait_until={strategy})"
+                )
 
-            # Check for bot detection
-            page_text = await self._page.inner_text("body")
-            if any(
-                marker in page_text.lower()
-                for marker in [
-                    "please verify you are a human",
-                    "access denied",
-                    "sorry, you have been blocked",
-                    "automated access",
-                    "px",
-                    "perimeterx",
-                    "challenge",
-                    "human verification",
-                ]
-            ):
-                logger.warning(f"Bot detection triggered at {url}")
-                return False
+                resp = await self._page.goto(
+                    url,
+                    wait_until=strategy,
+                    timeout=NAV_TIMEOUT_MS,
+                )
 
-            if wait_for_selector:
+                if resp is None and strategy != "commit":
+                    logger.warning(f"Null response from {url}, retrying...")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                # Wait a beat for dynamic content
+                await asyncio.sleep(POST_NAV_WAIT_SECS)
+
+                # Check page URL — detect redirects to captcha/bot pages
+                current_url = self._page.url
+                if "captcha" in current_url.lower() or "challenge" in current_url.lower():
+                    logger.warning(f"Redirected to captcha/challenge page at {current_url}")
+                    return False
+
+                # Check for bot detection text
                 try:
-                    await self._page.wait_for_selector(
-                        wait_for_selector, timeout=15000
-                    )
+                    page_text = await self._page.inner_text("body")
                 except Exception:
-                    logger.warning(
-                        f"Timeout waiting for selector: {wait_for_selector}"
+                    page_text = ""
+
+                if any(
+                    marker in page_text.lower()
+                    for marker in [
+                        "please verify you are a human",
+                        "access denied",
+                        "sorry, you have been blocked",
+                        "automated access",
+                        "perimeterx",
+                        "challenge",
+                        "human verification",
+                        "just a moment",
+                        "checking your browser",
+                    ]
+                ):
+                    logger.warning(f"Bot detection triggered at {url}")
+                    return False
+
+                if wait_for_selector:
+                    try:
+                        await self._page.wait_for_selector(
+                            wait_for_selector, timeout=15000
+                        )
+                    except Exception:
+                        logger.warning(
+                            f"Timeout waiting for selector: {wait_for_selector}"
+                        )
+
+                return True
+
+            except Exception as e:
+                logger.warning(
+                    f"Navigation error to {url} "
+                    f"(attempt {attempt + 1}, wait={strategy}): {e}"
+                )
+                if attempt < MAX_NAV_RETRIES:
+                    delay = 3 * (2 ** attempt)  # 3s, 6s
+                    logger.info(f"Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        f"All {MAX_NAV_RETRIES + 1} navigation attempts "
+                        f"failed for {url}"
                     )
 
-            return True
-
-        except Exception as e:
-            logger.error(f"Navigation error to {url}: {e}")
-            return False
+        return False
 
     async def _extract_text(
         self, element: Any, selector: str
