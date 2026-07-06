@@ -43,8 +43,12 @@ POST_NAV_WAIT_SECS = 3.0
 # Max seconds to wait for Cloudflare challenge to resolve (commit strategy)
 CF_CHALLENGE_MAX_WAIT = 20.0
 
-# Max retries per navigation
+# Max retries per navigation (wait-strategy fallbacks within one IP)
 MAX_NAV_RETRIES = 2
+
+# Max times to rotate to a fresh residential IP when a session is blocked
+# (PerimeterX 403) or the proxy tunnel is dead. Caps proxy spend per URL.
+MAX_SESSION_ROTATIONS = 4
 
 # Scroll delay to trigger lazy loading
 SCROLL_DELAY_SECS = 1.0
@@ -204,10 +208,9 @@ class FiverrScraper:
 
     async def __aenter__(self) -> "FiverrScraper":
         from apify import Actor
-        proxy_config = await Actor.create_proxy_configuration(
+        self._proxy_config = await Actor.create_proxy_configuration(
             actor_proxy_input=self.config.proxy_configuration
         )
-        proxy_url = await proxy_config.new_url() if proxy_config else None
 
         # Prefer Patchright (undetected Playwright fork) — it patches the
         # CDP/runtime leaks PerimeterX fingerprints on. Fall back to vanilla
@@ -221,7 +224,36 @@ class FiverrScraper:
         logger.info(f"Browser engine: {self._engine}")
 
         self._playwright = await async_playwright().start()
+        self._session_n = 0
+        self._browser = None
+        self._context = None
+        self._page = None
+        await self._launch_session()
+        return self
 
+    async def _proxy_launch_opt(self) -> dict | None:
+        """Fresh proxy URL for the current session → Playwright proxy dict.
+
+        A new session id yields a different sticky residential exit IP, which
+        is how we rotate away from PerimeterX-flagged / dead-tunnel IPs.
+        Chromium ignores inline creds in the server URL (→ HTTP 407), so
+        username/password must be split into separate fields.
+        """
+        if not self._proxy_config:
+            return None
+        proxy_url = await self._proxy_config.new_url(
+            session_id=f"fiverr{self._session_n}"
+        )
+        parsed = urlparse(proxy_url)
+        opt = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+        if parsed.username:
+            opt["username"] = parsed.username
+        if parsed.password:
+            opt["password"] = parsed.password
+        return opt
+
+    async def _launch_session(self) -> None:
+        """(Re)launch browser + context + page on a fresh proxy session."""
         # Container-safe args only. Under Patchright the classic "stealth" flags
         # (--disable-blink-features=AutomationControlled, --disable-web-security)
         # are counterproductive — they are themselves detectable and Patchright
@@ -243,19 +275,13 @@ class FiverrScraper:
                 "--window-size=1920,1080",
             ]
         launch_options = {"headless": True, "args": base_args}
-        if proxy_url:
-            # Chromium ignores inline proxy credentials in the server URL
-            # (http://user:pass@host:port) and returns HTTP 407. Playwright
-            # requires username/password as separate fields.
-            parsed_proxy = urlparse(proxy_url)
-            launch_options["proxy"] = {
-                "server": f"{parsed_proxy.scheme}://{parsed_proxy.hostname}"
-                f":{parsed_proxy.port}",
-            }
-            if parsed_proxy.username:
-                launch_options["proxy"]["username"] = parsed_proxy.username
-            if parsed_proxy.password:
-                launch_options["proxy"]["password"] = parsed_proxy.password
+        proxy_opt = await self._proxy_launch_opt()
+        if proxy_opt:
+            launch_options["proxy"] = proxy_opt
+            logger.info(
+                f"Launching session {self._session_n} "
+                f"via proxy {proxy_opt['server']}"
+            )
 
         self._browser = await self._playwright.chromium.launch(**launch_options)
 
@@ -331,7 +357,27 @@ class FiverrScraper:
         self._page = await self._context.new_page()
         self._page.set_default_timeout(NAV_TIMEOUT_MS)
         self._warmed = False
-        return self
+
+    async def _rotate_session(self) -> None:
+        """Tear down the current session and relaunch on a new residential IP.
+
+        PerimeterX is heavily IP-reputation based: a given sticky exit IP is
+        either flagged (403) or dead (ERR_TUNNEL_CONNECTION_FAILED), and a
+        different IP may pass. Rotating the proxy session id gets us a new one.
+        """
+        self._session_n += 1
+        logger.info(f"Rotating to a fresh proxy session ({self._session_n})...")
+        for closer in (
+            getattr(self, "_page", None),
+            getattr(self, "_context", None),
+            getattr(self, "_browser", None),
+        ):
+            try:
+                if closer:
+                    await closer.close()
+            except Exception:
+                pass
+        await self._launch_session()
 
     async def __aexit__(self, *args: Any) -> None:
         if self._context:
@@ -471,7 +517,32 @@ class FiverrScraper:
     async def _navigate(
         self, url: str, wait_for_selector: str | None = None
     ) -> bool:
-        """Navigate to a URL and wait for content.
+        """Navigate to a URL, rotating residential IPs on a blocked session.
+
+        Each IP gets the full wait-strategy retry set (`_try_navigate`). If the
+        whole set fails (PerimeterX 403 or a dead tunnel), rotate to a fresh
+        proxy session (new exit IP) and try again, up to MAX_SESSION_ROTATIONS.
+        A session that succeeds is kept for subsequent pages.
+        """
+        for session_attempt in range(1 + MAX_SESSION_ROTATIONS):
+            if await self._try_navigate(url, wait_for_selector):
+                return True
+            if session_attempt < MAX_SESSION_ROTATIONS:
+                logger.warning(
+                    f"Session blocked/failed for {url} — rotating IP "
+                    f"({session_attempt + 1}/{MAX_SESSION_ROTATIONS})."
+                )
+                await self._rotate_session()
+        logger.error(
+            f"Gave up on {url} after {MAX_SESSION_ROTATIONS + 1} IP sessions "
+            "— PerimeterX blocked every residential exit tried."
+        )
+        return False
+
+    async def _try_navigate(
+        self, url: str, wait_for_selector: str | None = None
+    ) -> bool:
+        """Navigate on the CURRENT proxy session and wait for content.
 
         Retries with fallback wait strategies if initial load fails.
         On commit strategy, actively waits for Cloudflare challenges to resolve
@@ -532,15 +603,12 @@ class FiverrScraper:
                     resolved = await self._wait_for_challenge_to_resolve()
                     if not resolved:
                         logger.error(
-                            f"Challenge did not resolve for {url}. "
-                            "PerimeterX is blocking this session — a residential "
-                            "proxy and/or a stealth browser engine is required. "
-                            "Retrying with a fresh strategy."
+                            f"Challenge did not resolve for {url} on this IP. "
+                            "PerimeterX block — bailing so caller can rotate IP."
                         )
-                        # Let the retry loop try again (new proxy URL / strategy)
-                        if attempt < MAX_NAV_RETRIES:
-                            await asyncio.sleep(3 * (2 ** attempt))
-                            continue
+                        # A hard PX 403 won't clear by retrying the same IP with
+                        # a different wait strategy, so return immediately and
+                        # let _navigate rotate to a fresh residential exit.
                         return False
                     # Challenge resolved — now we should be on the actual page
                     await asyncio.sleep(POST_NAV_WAIT_SECS)
