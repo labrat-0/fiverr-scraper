@@ -425,6 +425,9 @@ class FiverrScraper:
                     timeout=NAV_TIMEOUT_MS,
                 )
 
+                status = resp.status if resp else None
+                logger.info(f"HTTP {status} for {url} (strategy={strategy})")
+
                 if resp is None and strategy != "commit":
                     logger.warning(f"Null response from {url}, retrying...")
                     await asyncio.sleep(2 ** attempt)
@@ -491,8 +494,17 @@ class FiverrScraper:
 
                 # Check page has actual content
                 if not await self._check_page_content():
+                    # Diagnostic dump — what did we actually get back?
+                    try:
+                        diag_title = await self._page.title()
+                    except Exception:
+                        diag_title = "<title err>"
+                    body_len = len(page_text.strip())
+                    snippet = page_text.strip()[:200].replace("\n", " ")
                     logger.warning(
-                        f"Page loaded but has no meaningful content at {url}"
+                        f"Page loaded but has no meaningful content at {url} "
+                        f"| status={status} title={diag_title!r} "
+                        f"bodyLen={body_len} snippet={snippet!r}"
                     )
                     if strategy != "commit":
                         # Try next strategy
