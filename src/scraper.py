@@ -405,13 +405,25 @@ class FiverrScraper:
         except Exception:
             return False
 
+    # PerimeterX cookie names — presence means the sensor issued a token.
+    PX_COOKIE_NAMES = ("_px3", "_px2", "_pxvid", "pxcts")
+
+    async def _has_px_cookie(self) -> bool:
+        try:
+            cookies = await self._context.cookies()
+        except Exception:
+            return False
+        return any(c.get("name") in self.PX_COOKIE_NAMES for c in cookies)
+
     async def _warmup(self) -> None:
         """Prime the PerimeterX session before hitting deep URLs.
 
-        Cold-loading /search/gigs with no `_px3` cookie and no referer is a
-        strong bot signal → HTTP 403. A human lands on the homepage first, so
-        we do too: visit the homepage, let PX set its cookie, do a little
-        human-like movement, then real navigations carry the cookie + referer.
+        Homepage returns 200 and PX runs its sensor there; /search/gigs
+        returns 403 until a valid `_px3` token exists. The token is set by an
+        async sensor POST that fires only after the page settles AND sees real
+        interaction — so we must wait for network idle, generate interaction,
+        and poll for the cookie before navigating deeper. Navigating too early
+        (cookie-less) is exactly what produced the 403s.
         """
         self._warmed = True  # set first so a failed warmup doesn't loop
         try:
@@ -421,19 +433,38 @@ class FiverrScraper:
                 wait_until="domcontentloaded",
                 timeout=NAV_TIMEOUT_MS,
             )
-            await asyncio.sleep(random.uniform(3.0, 6.0))
             if await self._detect_challenge_page():
                 logger.info("Homepage warmup hit a challenge; waiting it out...")
                 await self._wait_for_challenge_to_resolve()
-            # Light human-like interaction to age the session.
+
+            # Let the sensor's network activity settle.
             try:
-                await self._page.mouse.move(
-                    random.randint(200, 800), random.randint(200, 600)
-                )
-                await self._page.evaluate("window.scrollTo(0, 500)")
-                await asyncio.sleep(random.uniform(1.0, 2.5))
+                await self._page.wait_for_load_state("networkidle", timeout=15000)
             except Exception:
                 pass
+
+            # Human-like interaction to trip the PX behavioural sensor.
+            for _ in range(3):
+                try:
+                    await self._page.mouse.move(
+                        random.randint(100, 1200), random.randint(100, 700)
+                    )
+                    await self._page.mouse.wheel(0, random.randint(300, 900))
+                except Exception:
+                    pass
+                await asyncio.sleep(random.uniform(0.8, 1.8))
+
+            # Poll for the PX token — up to ~15s — before going deeper.
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                if await self._has_px_cookie():
+                    logger.info("PerimeterX cookie acquired during warmup.")
+                    break
+                await asyncio.sleep(1.0)
+            else:
+                logger.warning(
+                    "No PerimeterX cookie after warmup — search may still 403."
+                )
         except Exception as e:
             logger.warning(f"Warmup navigation failed (continuing anyway): {e}")
 
