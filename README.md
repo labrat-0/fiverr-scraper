@@ -1,3 +1,5 @@
+> **⚠️ ARCHIVED — This actor has been deleted from Apify and is no longer maintained.**
+
 # Fiverr Scraper
 
 Scrape Fiverr gigs, search results, and seller profiles at scale. Search by keyword, extract full gig details (packages, FAQ, reviews), or scrape seller profiles. No API keys, no login required.
